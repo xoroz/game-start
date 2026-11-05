@@ -1,0 +1,27 @@
+{
+  "version": 3,
+  "name": "stardrift.zip",
+  "items": [
+    "Star Drift.sh",
+    "stardrift"
+  ],
+  "items_opt": [],
+  "attr": {
+    "title": "Star Drift",
+    "porter": ["felix"],
+    "desc": "1-2 player co-op with 5 ships to choose from. Shoot rocks and enemies that fire back, collect stars and clear levels. Unlock four guns, grab shields and extra lives. Synth sound and music.",
+    "desc_md": null,
+    "inst": "Ready to run. No extra files needed.",
+    "inst_md": null,
+    "genres": ["arcade"],
+    "image": {},
+    "rtr": true,
+    "exp": false,
+    "runtime": ["love_11.5"],
+    "store": [],
+    "availability": "full",
+    "reqs": [],
+    "arch": [],
+    "min_glibc": ""
+  }
+}
