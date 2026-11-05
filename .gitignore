@@ -45,6 +45,7 @@ luac.out
 
 # Build output (./build.sh) - the server builds its own copy
 dist/
+logs/
 
 # Local-only Claude Code settings
 .claude/settings.local.json
