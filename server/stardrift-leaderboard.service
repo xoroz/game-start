@@ -1,0 +1,19 @@
+# systemd unit for the Star Drift leaderboard API.
+# Install (repo cloned to /opt/stardrift): sudo cp /opt/stardrift/server/stardrift-leaderboard.service /etc/systemd/system/
+#          sudo systemctl daemon-reload && sudo systemctl enable --now stardrift-leaderboard
+[Unit]
+Description=Star Drift leaderboard API
+After=network.target
+
+[Service]
+DynamicUser=yes
+StateDirectory=stardrift
+ExecStart=/usr/bin/python3 /opt/stardrift/server/leaderboard.py --host 127.0.0.1 --port 8787 --db /var/lib/stardrift/leaderboard.sqlite3
+Restart=on-failure
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

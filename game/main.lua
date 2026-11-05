@@ -14,18 +14,22 @@
 -- In 2-player mode gamepad 1 is P1 and gamepad 2 is P2.
 
 local Audio = require("audio")
+local Scores = require("scores")
 
 local W, H = 640, 480
 local HANDHELD = os.getenv("STARDRIFT_HANDHELD") == "1"
+local WEB = love.system.getOS() == "Web"   -- love.js browser build
 -- dev only: STARDRIFT_TEST=1 auto-plays 2 players muted, saves screenshot.png to the save folder, then quits
 local TEST = os.getenv("STARDRIFT_TEST") == "1"
 -- dev only: STARDRIFT_TEST=select drives the ship select screen, saves select.png, then quits
 local TEST_SELECT = os.getenv("STARDRIFT_TEST") == "select"
+-- dev only: STARDRIFT_TEST=scores ends a game, enters initials, saves scores.png, then quits
+local TEST_SCORES = os.getenv("STARDRIFT_TEST") == "scores"
 local testTime, testShot, testSpawned = 0, false, false
 
 local canvas, scale, offx, offy
 local fontBig, fontSmall, fontTiny
-local state = "title"   -- title | select | play | pause | over
+local state = "title"   -- title | select | play | pause | entry | over
 local numPlayers, menuSel = 1, 1
 -- ship choice per player id (index into SHIPS); kept between games
 local picks = { { ship = 1, ready = false }, { ship = 2, ready = false } }
@@ -35,6 +39,7 @@ local enemies, ebullets, pickups, pickupPlan
 local score, best, level, starsGot, spawnTimer, enemyTimer, levelTime, shake
 local banner, bannerText, bannerSub
 local pads = {}
+local entry  -- initials on the entry screen: { letters = { byte, byte, byte }, pos = 1..3 }
 
 -- star shape is concave, so pre-split it into triangles once
 local starTris
@@ -56,8 +61,10 @@ local function dist2(a, b) local dx, dy = a.x - b.x, a.y - b.y; return dx * dx +
 local function onScreen(o) return o.x > 0 and o.x < W and o.y > 0 and o.y < H end
 
 local function loadBest()
-  local s = love.filesystem.read("best.txt")
-  return tonumber(s) or 0
+  -- love.js raises an error for a missing file instead of returning nil
+  if not love.filesystem.getInfo("best.txt") then return 0 end
+  local ok, s = pcall(love.filesystem.read, "best.txt")
+  return ok and tonumber(s) or 0
 end
 
 local function saveBest()
@@ -474,6 +481,24 @@ local function tryDash(p)
   end
 end
 
+-- ask for initials when there is a score to keep, otherwise straight to the score table
+local function gameOver()
+  if score > best then best = score; saveBest() end
+  Audio.play("gameover", 0)
+  if score > 0 then
+    entry = { letters = { Scores.lastName():byte(1, 3) }, pos = 1 }
+    state = "entry"
+  else
+    Scores.refresh()
+    state = "over"
+  end
+end
+
+local function submitEntry()
+  Scores.submit(string.char(unpack(entry.letters)), score, level)
+  state = "over"
+end
+
 local function damagePlayer(p)
   if p.shield > 0 then
     burst(p.x, p.y, { 0.4, 0.9, 1 }, 10, 120)
@@ -488,11 +513,7 @@ local function damagePlayer(p)
   if p.lives <= 0 then
     p.alive = false
     burst(p.x, p.y, { 1, 0.8, 0.4 }, 60, 260)
-    if #alivePlayers() == 0 then
-      if score > best then best = score; saveBest() end
-      state = "over"
-      Audio.play("gameover", 0)
-    end
+    if #alivePlayers() == 0 then gameOver() end
   end
 end
 
@@ -580,7 +601,7 @@ local function updateBullets(dt)
           break
         end
       end
-      if state == "over" then return end
+      if state ~= "play" then return end
     end
   end
 end
@@ -603,7 +624,7 @@ local function updatePlay(dt)
   levelTime = levelTime + dt
   for _, p in ipairs(players) do updatePlayer(p, dt) end
   updateBullets(dt)
-  if state == "over" then return end
+  if state ~= "play" then return end
 
   -- no spawns while the level banner shows; spawns speed up each level
   if banner > 0 then
@@ -658,7 +679,7 @@ local function updatePlay(dt)
       if p then
         destroyRock(i)
         damagePlayer(p)
-        if state == "over" then return end
+        if state ~= "play" then return end
       end
     end
   end
@@ -675,7 +696,7 @@ local function updatePlay(dt)
         e.flash = 0.08
         if e.hp <= 0 then killEnemy(i) end
         damagePlayer(p)
-        if state == "over" then return end
+        if state ~= "play" then return end
       end
     end
   end
@@ -1011,7 +1032,7 @@ local function drawWorld()
     love.graphics.rectangle("fill", p.x - 1.5, p.y - 1.5, 3, 3)
   end
 
-  if state ~= "over" then
+  if state == "play" or state == "pause" then
     for _, p in ipairs(players) do drawPlayer(p) end
   end
 
@@ -1117,6 +1138,68 @@ local function drawSelect()
   centered("LEFT/RIGHT choose   A confirm   B change   SELECT back" .. keys, 410, fontTiny)
 end
 
+local function dim()
+  love.graphics.setColor(0, 0, 0, 0.6)
+  love.graphics.rectangle("fill", 0, 0, W, H)
+  love.graphics.setColor(1, 1, 1)
+end
+
+local function drawEntry()
+  dim()
+  centered("GAME OVER", 100, fontBig)
+  centered("Level " .. level .. "    Score " .. score, 160, fontSmall)
+  love.graphics.setColor(1, 0.85, 0.3)
+  centered("ENTER YOUR INITIALS", 205, fontSmall)
+  love.graphics.setFont(fontBig)
+  for i, b in ipairs(entry.letters) do
+    local x = W / 2 + (i - 2) * 56
+    local cur = i == entry.pos
+    if cur then
+      local blink = math.floor(love.timer.getTime() * 3) % 2 == 0
+      love.graphics.setColor(1, 0.85, 0.3, blink and 1 or 0.6)
+      love.graphics.polygon("fill", x - 7, 250, x + 7, 250, x, 241)
+      love.graphics.polygon("fill", x - 7, 304, x + 7, 304, x, 313)
+      love.graphics.rectangle("fill", x - 18, 297, 36, 3)
+    else
+      love.graphics.setColor(1, 1, 1, 0.8)
+    end
+    love.graphics.printf(string.char(b), x - 30, 253, 60, "center")
+  end
+  love.graphics.setColor(1, 1, 1, 0.7)
+  centered("UP/DOWN letter   LEFT/RIGHT move   A next   START save\nKeyboard: type letters, Enter to save   SELECT skip", 345, fontTiny)
+end
+
+local function drawScoreTable()
+  dim()
+  centered("GAME OVER", 50, fontBig)
+  centered("Level " .. level .. "    Score " .. score, 100, fontSmall)
+  love.graphics.setColor(1, 0.85, 0.3)
+  centered(Scores.status == "online" and "WORLD TOP 5" or "TOP 5", 140, fontSmall)
+  love.graphics.setFont(fontSmall)
+  for i = 1, 5 do
+    local e, y = Scores.top[i], 172 + (i - 1) * 28
+    if i == Scores.rank then
+      love.graphics.setColor(1, 0.85, 0.3, 0.2)
+      love.graphics.rectangle("fill", W / 2 - 150, y - 3, 300, 24, 4)
+      love.graphics.setColor(1, 0.85, 0.3)
+    else
+      love.graphics.setColor(1, 1, 1, e and 0.9 or 0.3)
+    end
+    love.graphics.print(i .. ".", W / 2 - 140, y)
+    love.graphics.print(e and e.name or "---", W / 2 - 100, y)
+    love.graphics.printf(e and tostring(e.score) or "", W / 2 - 60, y, 110, "right")
+    love.graphics.printf(e and ("LV " .. e.level) or "", W / 2 + 60, y, 80, "right")
+  end
+  love.graphics.setColor(1, 1, 1, 0.7)
+  local note = ""
+  if Scores.rank and Scores.rank > 5 then note = "You placed #" .. Scores.rank end
+  if Scores.status == "loading" then note = "Loading scores..."
+  elseif Scores.status == "offline" then note = "Offline - showing scores saved on this device" end
+  centered(note, 320, fontTiny)
+  love.graphics.setColor(1, 1, 1)
+  centered("START retry   SELECT title screen", 370, fontSmall)
+end
+
 local function drawOverlay()
   love.graphics.setColor(1, 1, 1)
   if state == "title" then
@@ -1129,10 +1212,10 @@ local function drawOverlay()
     love.graphics.setColor(1, 1, 1)
     centered("PAUSED", 170, fontBig)
     centered("START resume   SELECT title screen\nY / M music on/off", 250, fontSmall)
+  elseif state == "entry" then
+    drawEntry()
   elseif state == "over" then
-    centered("GAME OVER", 150, fontBig)
-    centered("Level " .. level .. "    Score " .. score .. "    Best " .. best, 230, fontSmall)
-    centered("START retry   SELECT title screen", 280, fontSmall)
+    drawScoreTable()
   elseif state == "play" and banner > 0 then
     local a = math.min(1, banner)
     love.graphics.setColor(1, 1, 1, a)
@@ -1151,9 +1234,14 @@ function love.load()
   love.graphics.setDefaultFilter("nearest", "nearest")
   if HANDHELD then love.window.setFullscreen(true) end
   love.mouse.setVisible(not HANDHELD)
-  if not HANDHELD and not TEST and not TEST_SELECT then love.window.maximize() end
+  if not HANDHELD and not WEB and not TEST and not TEST_SELECT then love.window.maximize() end
   resize(love.graphics.getDimensions())
+  if TEST_SCORES then  -- keep test scores out of the real save folder
+    love.filesystem.setIdentity("stardrift-test")
+    love.filesystem.remove("scores.txt")
+  end
   best = loadBest()
+  Scores.load(WEB)
   bgstars = {}
   for _ = 1, 80 do
     bgstars[#bgstars + 1] = { x = love.math.random(W), y = love.math.random(H), speed = love.math.random(10, 60) }
@@ -1171,6 +1259,17 @@ function love.load()
     action("right", 1)
     action("confirm", 1)          -- ... and locks it in
     action("right", 2)            -- P2 also moves onto VIPER, which is now taken
+  end
+  if TEST_SCORES then
+    love.audio.setVolume(0)
+    state, score, level = "play", 1234, 3
+    gameOver()
+    entry.letters = { 65, 65, 65 }  -- AAA
+    action("up", 1)               -- B
+    action("right", 1)
+    action("down", 1)             -- Z
+    action("confirm", 1)
+    action("confirm", 1)          -- last slot: saves "BZA"
   end
 end
 
@@ -1220,6 +1319,20 @@ function love.update(dt)
       love.event.quit()
     end
   end
+  if TEST_SCORES then
+    testTime = testTime + dt
+    if testTime > 0.5 and not testShot then
+      testShot = true
+      love.graphics.captureScreenshot("scores.png")
+    elseif testTime > 1 then
+      local top = {}
+      for _, e in ipairs(Scores.top) do top[#top + 1] = e.name .. "=" .. e.score end
+      print("TEST state=" .. state .. " rank=" .. tostring(Scores.rank) .. " status=" .. Scores.status ..
+            " top=" .. table.concat(top, ","))
+      love.event.quit()
+    end
+  end
+  Scores.update(dt)
   if state == "select" and startDelay then
     startDelay = startDelay - dt
     if startDelay <= 0 then
@@ -1246,6 +1359,25 @@ function love.draw()
   love.graphics.clear(0, 0, 0)
   love.graphics.setColor(1, 1, 1)
   love.graphics.draw(canvas, offx, offy, 0, scale, scale)
+end
+
+local function entryAction(a)
+  local e = entry
+  if a == "up" or a == "down" then
+    local b = e.letters[e.pos] - 65 + (a == "up" and 1 or -1)
+    e.letters[e.pos] = b % 26 + 65
+  elseif a == "left" or a == "prev" or a == "dash" then
+    e.pos = math.max(1, e.pos - 1)
+  elseif a == "right" or a == "next" then
+    e.pos = math.min(3, e.pos + 1)
+  elseif a == "confirm" then
+    if e.pos < 3 then e.pos = e.pos + 1 else submitEntry() end
+  elseif a == "start" then
+    submitEntry()
+  elseif a == "back" then
+    Scores.refresh()
+    state = "over"
+  end
 end
 
 local function selectAction(a, id)
@@ -1285,11 +1417,13 @@ function action(a, id)
       numPlayers = menuSel
       for _, pk in ipairs(picks) do pk.ready = false end
       state = "select"
-    elseif a == "back" then
+    elseif a == "back" and not WEB then   -- quitting in a browser only leaves a frozen canvas
       love.event.quit()
     end
   elseif state == "select" then
     selectAction(a, id)
+  elseif state == "entry" then
+    entryAction(a)
   elseif state == "over" then
     if a == "start" or a == "confirm" then newGame(); state = "play"
     elseif a == "back" then state = "title" end
@@ -1306,12 +1440,21 @@ function action(a, id)
 end
 
 local GLOBAL_KEYS = { ["return"] = "start", escape = "back", backspace = "back", m = "music" }
+local ENTRY_KEYS = {
+  up = "up", down = "down", left = "left", right = "right", ["return"] = "start", kpenter = "start",
+  backspace = "dash", escape = "back",
+}
 local MENU_KEYS = { up = "up", w = "up", down = "down", s = "down", space = "confirm", z = "confirm" }
 
 function love.keypressed(k)
   if k == "f11" then
     love.window.setFullscreen(not love.window.getFullscreen())
     return resize(love.graphics.getDimensions())
+  end
+  -- letters arrive through love.textinput while typing initials
+  if state == "entry" then
+    if ENTRY_KEYS[k] then action(ENTRY_KEYS[k], 1) end
+    return
   end
   if GLOBAL_KEYS[k] then return action(GLOBAL_KEYS[k], 1) end
   if state == "title" and MENU_KEYS[k] then return action(MENU_KEYS[k], 1) end
@@ -1325,6 +1468,12 @@ function love.keypressed(k)
       end
     end
   end
+end
+
+function love.textinput(t)
+  if state ~= "entry" or not t:match("^%a$") then return end
+  entry.letters[entry.pos] = t:upper():byte()
+  entry.pos = math.min(3, entry.pos + 1)
 end
 
 local PAD_ACTIONS = {

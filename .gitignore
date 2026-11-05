@@ -39,3 +39,16 @@ luac.out
 *.x86_64
 *.hex
 
+
+# Leaderboard databases
+*.sqlite3
+
+# Build output (./build.sh) - the server builds its own copy
+dist/
+
+# Local-only Claude Code settings
+.claude/settings.local.json
+
+# update.sh state on the server
+.deployed-commit
+.update.lock

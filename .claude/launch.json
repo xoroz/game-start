@@ -1,0 +1,31 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "web",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": [
+        "-m",
+        "http.server",
+        "-d",
+        "dist/web",
+        "8000"
+      ],
+      "port": 8000
+    },
+    {
+      "name": "web-leaderboard",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": [
+        "server/leaderboard.py",
+        "--static",
+        "dist/web",
+        "--port",
+        "8001",
+        "--db",
+        "dist/leaderboard-dev.sqlite3"
+      ],
+      "port": 8001
+    }
+  ]
+}
