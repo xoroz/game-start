@@ -1,21 +1,27 @@
--- High score table. Every score is kept in scores.txt in the save folder. In the browser build
--- the shared online table from the leaderboard server is shown instead, reached through the page's
+-- High score tables, one per difficulty. Every score is kept in the save folder (scores.txt for
+-- NORMAL, scores-easy.txt / scores-hard.txt for the others). In the browser build the shared
+-- online table from the leaderboard server is shown instead, reached through the page's
 -- JavaScript (web/leaderboard.js): requests go out as print lines, answers come back as a file.
 
 local Scores = {}
 
+local MODES = { "easy", "normal", "hard" }
 local TOP_N = 5
-local KEEP = 100                -- local entries kept on disk
+local KEEP = 100                -- local entries kept on disk per difficulty
 local TIMEOUT = 8               -- seconds to wait for the server
 local REPLY = "leaderboard.txt"
 
 local web = false
 local pending                   -- seconds waited for a server reply, nil when idle
-local localList = {}            -- { name, score, level }, best first
+local lists = {}                -- mode -> { { name, score, level }, ... } best first
 
 Scores.top = {}                 -- what the game-over screen shows
 Scores.rank = nil               -- rank of the score just submitted
 Scores.status = "local"         -- local | loading | online | offline
+
+local function fileFor(mode)
+  return mode == "normal" and "scores.txt" or ("scores-" .. mode .. ".txt")
+end
 
 local function parse(line)
   local name, score, level = line:match("^(%u%u%u) (%d+) (%d+)$")
@@ -38,13 +44,13 @@ local function firstN(list)
   return t
 end
 
-local function saveLocal()
+local function saveLocal(mode)
   local lines = {}
-  for i = 1, math.min(KEEP, #localList) do
-    local e = localList[i]
+  for i, e in ipairs(lists[mode]) do
+    if i > KEEP then break end
     lines[i] = e.name .. " " .. e.score .. " " .. e.level
   end
-  love.filesystem.write("scores.txt", table.concat(lines, "\n") .. "\n")
+  love.filesystem.write(fileFor(mode), table.concat(lines, "\n") .. "\n")
 end
 
 local function request(...)
@@ -56,12 +62,14 @@ end
 
 function Scores.load(isWeb)
   web = isWeb
-  localList = {}
-  for line in (readFile("scores.txt") or ""):gmatch("[^\n]+") do
-    localList[#localList + 1] = parse(line)
+  for _, mode in ipairs(MODES) do
+    local list = {}
+    for line in (readFile(fileFor(mode)) or ""):gmatch("[^\n]+") do
+      list[#list + 1] = parse(line)
+    end
+    sortList(list)
+    lists[mode] = list
   end
-  sortList(localList)
-  Scores.top = firstN(localList)
 end
 
 -- last initials entered, so returning players only need to press confirm
@@ -71,25 +79,28 @@ function Scores.lastName()
 end
 
 -- the score is always kept locally; online it is also sent to the server
-function Scores.submit(name, score, level)
+function Scores.submit(name, score, level, mode)
   love.filesystem.write("initials.txt", name)
+  local list = lists[mode]
   local entry = { name = name, score = score, level = level }
-  localList[#localList + 1] = entry
-  sortList(localList)
-  saveLocal()
-  Scores.top = firstN(localList)
+  list[#list + 1] = entry
+  sortList(list)
+  saveLocal(mode)
+  Scores.top = firstN(list)
   Scores.rank = nil
-  for i, e in ipairs(localList) do
+  for i, e in ipairs(list) do
     if e == entry then Scores.rank = i end
   end
-  if web then request("submit", name, score, level) end
+  Scores.status = "local"
+  if web then request("submit", name, score, level, mode) end
 end
 
--- show the table without adding a score (game over with 0 points)
-function Scores.refresh()
-  Scores.top = firstN(localList)
+-- show a table without adding a score (game over with 0 points)
+function Scores.refresh(mode)
+  Scores.top = firstN(lists[mode])
   Scores.rank = nil
-  if web then request("top") end
+  Scores.status = "local"
+  if web then request("top", mode) end
 end
 
 function Scores.update(dt)

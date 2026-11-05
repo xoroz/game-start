@@ -1,6 +1,6 @@
 # Star Drift
 
-A 1–2 player co-op arcade shooter made with [LÖVE](https://love2d.org/) 11.5. Pick one of five ships, shoot rocks and enemies that fire back, collect stars to clear levels, unlock four guns, and grab shields and extra lives. All graphics are drawn in code and all sound and music is synthesized at startup, so the game has no asset files.
+A 1–2 player co-op arcade shooter made with [LÖVE](https://love2d.org/) 11.5. Pick one of five ships and a difficulty (EASY, NORMAL, HARD), shoot rocks and enemies that fire back, collect stars to clear levels, unlock four guns, and beat a boss after every third level. Pick up shields, extra lives, super missiles and super bombs along the way. All graphics are drawn in code and all sound and music is synthesized at startup, so the game has no asset files.
 
 It runs on desktop, on Linux retro handhelds through [PortMaster](https://portmaster.games/), and in a web browser through [love.js](https://github.com/Davidobot/love.js).
 
@@ -9,10 +9,13 @@ It runs on desktop, on Linux retro handhelds through [PortMaster](https://portma
 | Action | Gamepad | Keyboard P1 | Keyboard P2 |
 |---|---|---|---|
 | Move | D-pad / left stick | WASD | Arrows |
-| Fire (hold) | A, X or right trigger | Space / F | Right Ctrl / . |
+| Fire (hold) | A or right trigger | Space / F | Right Ctrl / . |
 | Aim + fire | Right stick | | |
 | Dash | B or left trigger | Left Shift / G | / |
-| Switch gun | L1 / R1 / Y | Q / E | , |
+| Super bomb | X | C | ' |
+| Super missile | Y | R | ; |
+| Switch gun | L1 / R1 | Q / E | , |
+| Difficulty (title screen) | Left / right | A / D or arrows | |
 | Start / pause | Start | Enter | |
 | Music on/off | Y while paused | M | |
 | Back / quit | Select | Esc | |
@@ -38,9 +41,16 @@ Set `STARDRIFT_HANDHELD=1` to try the handheld setup (fullscreen, no mouse, 1x r
 STARDRIFT_TEST=1 love game
 STARDRIFT_TEST=select love game
 STARDRIFT_TEST=scores love game
+STARDRIFT_TEST=boss love game
 ```
 
-The first runs a muted 2-player game at level 7 for about 12 seconds. The second walks through the ship-select screen. The third ends a game, enters initials and shows the score table (it uses a separate `stardrift-test` save folder). Each prints a `TEST ...` line, saves a screenshot to the save folder (`~/.local/share/love/stardrift/` on Linux), and quits.
+The first runs a muted 2-player game at level 7 for about 12 seconds. The second walks through the ship-select screen. The third ends a game, enters initials and shows the score table. The fourth fights the first boss with a super bomb and missile, then defeats it. All test modes use a separate `stardrift-test` save folder and ignore real gamepads.
+
+## Gameplay
+
+- **Difficulty:** EASY gives 5 lives and 2 bombs, slower enemy fire and fewer rocks. HARD gives 2 lives and no bombs, with faster, more aggressive enemies and tougher bosses.
+- **Bosses:** after levels 3, 6, 9 and so on. Each boss fires aimed fans, rings and spirals; from the second boss on it also calls in drones. Below half health it gets faster. Beating it leaves an extra life and a bomb behind.
+- **Items:** shield (8 seconds of protection), extra life, super missile (+2; a big homing missile that blows up everything nearby) and super bomb (+1; clears every rock, enemy and enemy bullet on screen and takes 15% off a boss). Items appear during levels, and destroyed enemies sometimes drop one. Each prints a `TEST ...` line, saves a screenshot to the save folder (`~/.local/share/love/stardrift/` on Linux), and quits.
 
 ## Building
 
@@ -57,7 +67,7 @@ Run `./build.sh --no-web` to build only the port.
 
 ## High scores
 
-When a game ends with points, players enter three initials (D-pad up/down changes the letter, left/right moves, A goes to the next letter, Start saves; on a keyboard just type and press Enter). The game-over screen then shows the top 5.
+When a game ends with points, players enter three initials (D-pad up/down changes the letter, left/right moves, A goes to the next letter, Start saves; on a keyboard just type and press Enter). The game-over screen then shows the top 5 for the difficulty you played; each difficulty has its own table.
 
 - **Desktop and handheld:** scores are saved on the device (`scores.txt` in the save folder).
 - **Browser:** scores go to the shared online leaderboard on your server (`server/leaderboard.py`), so everyone sees the same "WORLD TOP 5". If the server can't be reached, the game shows the scores saved in that browser instead.

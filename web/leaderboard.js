@@ -1,7 +1,7 @@
 // Bridge between the game (Lua in love.js) and the leaderboard API.
 // Lua cannot make HTTP requests, so it prints a request line:
-//   STARDRIFT_API|<save dir>|top
-//   STARDRIFT_API|<save dir>|submit|ABC|1234|5
+//   STARDRIFT_API|<save dir>|top|<difficulty>
+//   STARDRIFT_API|<save dir>|submit|ABC|1234|5|<difficulty>
 // and this script answers by writing <save dir>/leaderboard.txt, which the game polls:
 //   ok <rank or 0>
 //   ABC 1234 5        (up to 5 lines, best first)
@@ -33,10 +33,12 @@
       req = fetch(API, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name: parts[3], score: Number(parts[4]), level: Number(parts[5]) }),
+        body: JSON.stringify({
+          name: parts[3], score: Number(parts[4]), level: Number(parts[5]), difficulty: parts[6],
+        }),
       });
     } else {
-      req = fetch(API, { cache: "no-store" });
+      req = fetch(API + "?difficulty=" + encodeURIComponent(parts[3]), { cache: "no-store" });
     }
     req.then(function (r) {
       if (!r.ok) throw new Error("HTTP " + r.status);

@@ -3,15 +3,19 @@
 --
 -- Controls            Gamepad               Keyboard P1            Keyboard P2
 --   move              d-pad / left stick    WASD                   arrows
---   fire (hold)       A, X or right trigger Space / F              Right Ctrl / .
+--   fire (hold)       A or right trigger    Space / F              Right Ctrl / .
 --   aim + fire        right stick
 --   dash              B or left trigger     Left Shift / G         /
---   switch gun        L1 / R1 / Y           Q / E                  ,
+--   super bomb        X                     C                      '
+--   super missile     Y                     R                      ;
+--   switch gun        L1 / R1               Q / E                  ,
 --   start / pause     Start                 Enter
 --   music on/off      Y while paused        M
 --   back / quit       Select                Esc
 --   fullscreen                              F11
 -- In 1-player mode every gamepad and both keyboard sets (plus Z / X / Tab) drive P1.
+-- The title screen picks EASY / NORMAL / HARD (left/right); each has its own high score table.
+-- Every 3rd level is followed by a boss stage.
 -- In 2-player mode each gamepad joins by pressing A on the ship select screen (first = P1).
 -- Menus also follow the left stick. Unplugging a player's gamepad pauses the game.
 
@@ -27,7 +31,10 @@ local TEST = os.getenv("STARDRIFT_TEST") == "1"
 local TEST_SELECT = os.getenv("STARDRIFT_TEST") == "select"
 -- dev only: STARDRIFT_TEST=scores ends a game, enters initials, saves scores.png, then quits
 local TEST_SCORES = os.getenv("STARDRIFT_TEST") == "scores"
-local TESTING = TEST or TEST_SELECT or TEST_SCORES   -- real gamepads are ignored while testing
+-- dev only: STARDRIFT_TEST=boss fights boss 1 with bomb + missile, saves boss.png, kills it, then quits
+local TEST_BOSS = os.getenv("STARDRIFT_TEST") == "boss"
+local TESTING = TEST or TEST_SELECT or TEST_SCORES or TEST_BOSS   -- real gamepads are ignored while testing
+local AUTOPLAY = TEST or TEST_BOSS                                 -- ships fly and fire on their own
 local testTime, testShot, testSpawned = 0, false, false
 
 local canvas, scale, offx, offy
@@ -39,6 +46,8 @@ local picks = { { ship = 1, ready = false }, { ship = 2, ready = false } }
 local startDelay  -- short pause after everyone is ready on the select screen
 local players, rocks, stars, bullets, particles, bgstars
 local enemies, ebullets, pickups, pickupPlan
+local boss    -- the boss on boss stages (after every 3rd level), nil otherwise
+local flash   -- white screen flash from a super bomb, seconds left
 local score, best, level, starsGot, spawnTimer, enemyTimer, levelTime, shake
 local banner, bannerText, bannerSub
 local pads = {}
@@ -46,7 +55,21 @@ local padOwner, playerPad = {}, {}  -- 2-player: joystick -> player id, player i
 local stickState = {}               -- joystick -> { dir, t } for left-stick menu navigation
 local pauseNote                     -- extra line on the pause screen
 local rumble                        -- controller vibration, defined in the input section
+local dropItem                      -- random item from a destroyed enemy, defined in the pickups section
 local entry  -- initials on the entry screen: { letters = { byte, byte, byte }, pos = 1..3 }
+
+-- shot = enemy bullet speed, cool = enemy fire delay, spawn = rock/enemy spawn delay, rock = rock speed,
+-- boss = boss health, drop = chance an enemy drops an item
+local DIFFICULTIES = {
+  { key = "easy",   name = "EASY",   color = { 0.4, 1, 0.5 },  lives = 5, bombs = 2,
+    shot = 0.75, cool = 1.4,  spawn = 1.35, rock = 0.85, boss = 0.7, drop = 0.14 },
+  { key = "normal", name = "NORMAL", color = { 1, 0.85, 0.3 }, lives = 3, bombs = 1,
+    shot = 1,    cool = 1,    spawn = 1,    rock = 1,    boss = 1,   drop = 0.09 },
+  { key = "hard",   name = "HARD",   color = { 1, 0.35, 0.35 }, lives = 2, bombs = 0,
+    shot = 1.25, cool = 0.75, spawn = 0.75, rock = 1.15, boss = 1.4, drop = 0.06 },
+}
+local diffSel = 2
+local diff = DIFFICULTIES[diffSel]
 
 -- star shape is concave, so pre-split it into triangles once
 local starTris
@@ -67,15 +90,23 @@ local function clamp(v, lo, hi) return math.max(lo, math.min(hi, v)) end
 local function dist2(a, b) local dx, dy = a.x - b.x, a.y - b.y; return dx * dx + dy * dy end
 local function onScreen(o) return o.x > 0 and o.x < W and o.y > 0 and o.y < H end
 
-local function loadBest()
-  -- love.js raises an error for a missing file instead of returning nil
-  if not love.filesystem.getInfo("best.txt") then return 0 end
-  local ok, s = pcall(love.filesystem.read, "best.txt")
-  return ok and tonumber(s) or 0
+-- one best score per difficulty; NORMAL keeps the original best.txt
+local function bestFile() return diff.key == "normal" and "best.txt" or ("best-" .. diff.key .. ".txt") end
+
+-- love.js raises an error for a missing file instead of returning nil
+local function readSave(name)
+  if not love.filesystem.getInfo(name) then return nil end
+  local ok, s = pcall(love.filesystem.read, name)
+  return ok and s or nil
 end
 
-local function saveBest()
-  love.filesystem.write("best.txt", tostring(best))
+local function loadBest() return tonumber(readSave(bestFile())) or 0 end
+local function saveBest() love.filesystem.write(bestFile(), tostring(best)) end
+
+local function setDifficulty(i)
+  diffSel = (i - 1) % #DIFFICULTIES + 1
+  diff = DIFFICULTIES[diffSel]
+  best = loadBest()
 end
 
 local function burst(x, y, color, n, speed)
@@ -150,7 +181,8 @@ local function vulnerable(p) return p.alive and p.dash <= 0 and p.hurt <= 0 end
 local function newPlayer(id)
   local x = numPlayers == 1 and W / 2 or (id == 1 and W / 2 - 50 or W / 2 + 50)
   return { id = id, ship = picks[id].ship, x = x, y = H / 2 + 40, vx = 0, vy = 0, r = 9, angle = -math.pi / 2,
-           dash = 0, dashCd = 0, cool = 0, gun = 1, lives = 3, hurt = 0, shield = 0,
+           dash = 0, dashCd = 0, cool = 0, gun = 1, lives = diff.lives, hurt = 0, shield = 0,
+           bombs = diff.bombs, missiles = 0,
            thrust = 0, alive = true }
 end
 
@@ -183,9 +215,10 @@ local function switchGun(p, dir)
   p.gun = (p.gun - 1 + dir) % n + 1
 end
 
--- homing missiles chase whatever rock or enemy is closest
+-- homing missiles chase whatever rock, enemy or boss is closest
 local function nearestTarget(b)
   local best_, bestD = nil, math.huge
+  if boss and not boss.dying then best_, bestD = boss, dist2(boss, b) end
   for _, list in ipairs({ rocks, enemies }) do
     for _, o in ipairs(list) do
       local d = dist2(o, b)
@@ -208,6 +241,7 @@ local ENEMIES = {
 local ENEMY_ORDER = { "drone", "spinner", "hunter" }
 
 local function enemyShot(e, angle, speed)
+  speed = speed * diff.shot
   ebullets[#ebullets + 1] = { x = e.x, y = e.y, vx = math.cos(angle) * speed, vy = math.sin(angle) * speed, life = 4 }
 end
 
@@ -250,7 +284,10 @@ local function killEnemy(i, by)
   score = score + ENEMIES[e.kind].pts
   shake = math.max(shake, 0.15)
   Audio.play("boom")
-  if by then rumble(by, 0.35, 0.12) end
+  if by then
+    rumble(by, 0.35, 0.12)
+    if love.math.random() < diff.drop then dropItem(e.x, e.y) end
+  end
 end
 
 local function updateEnemy(e, dt)
@@ -287,6 +324,7 @@ local function updateEnemy(e, dt)
         for k = -1, 1 do enemyShot(e, a + k * 0.2, 170) end
         e.cool = 1.4
       end
+      e.cool = e.cool * diff.cool
       Audio.play("enemyShot")
     end
   end
@@ -296,9 +334,10 @@ end
 
 local KEYS = {
   { up = { "w" }, down = { "s" }, left = { "a" }, right = { "d" },
-    fire = { "space", "f" }, dash = { "lshift", "g" }, prev = { "q" }, next = { "e" } },
+    fire = { "space", "f" }, dash = { "lshift", "g" }, prev = { "q" }, next = { "e" },
+    bomb = { "c" }, missile = { "r" } },
   { up = { "up" }, down = { "down" }, left = { "left" }, right = { "right" },
-    fire = { "rctrl", "." }, dash = { "/", "ralt" }, next = { "," } },
+    fire = { "rctrl", "." }, dash = { "/", "ralt" }, next = { "," }, bomb = { "'" }, missile = { ";" } },
   -- extra keys that only apply in 1-player mode
   solo = { fire = { "z" }, dash = { "x" }, next = { "tab" } },
 }
@@ -350,7 +389,7 @@ end
 
 -- right stick direction for twin-stick aiming, or nil when centred
 local function aimAxis(p)
-  if TEST then return nil end
+  if AUTOPLAY then return nil end
   local list = padsFor(p)
   local x, y = padAxis(list, "rightx"), padAxis(list, "righty")
   if x * x + y * y < 0.35 ^ 2 then return nil end
@@ -389,38 +428,54 @@ local function axis(p)
       if math.abs(sy) > 0.25 then dy = dy + sy end
     end
   end
-  if TEST then dx, dy = math.cos(testTime * 1.3 + p.id * 2), math.sin(testTime * (0.7 + p.id * 0.2)) end
+  if AUTOPLAY then dx, dy = math.cos(testTime * 1.3 + p.id * 2), math.sin(testTime * (0.7 + p.id * 0.2)) end
   local len = math.sqrt(dx * dx + dy * dy)
   if len > 1 then dx, dy = dx / len, dy / len end
   return dx, dy
 end
 
 local function fireHeld(p)
-  if TEST then return true end
+  if AUTOPLAY then return true end
   local list = padsFor(p)
-  return keyDown(keysetsFor(p), "fire") or padDown(list, "a") or padDown(list, "x")
-      or padAxis(list, "triggerright") > 0.4
+  return keyDown(keysetsFor(p), "fire") or padDown(list, "a") or padAxis(list, "triggerright") > 0.4
 end
 
 ---------------------------------------------------------------- pickups
 
-local function spawnPickup(kind)
+-- life: +1 life   shield: 8 s bubble   missile: +2 super missiles   bomb: +1 super bomb
+local PICKUP_COLORS = {
+  life = { 1, 0.4, 0.6 }, shield = { 0.4, 0.9, 1 }, missile = { 1, 0.6, 0.2 }, bomb = { 1, 0.3, 0.25 },
+}
+
+-- appears at x, y (or a random spot) and drifts around for 7 seconds
+local function spawnPickup(kind, x, y)
   local a = love.math.random() * math.pi * 2
   pickups[#pickups + 1] = {
-    kind = kind, x = love.math.random(60, W - 60), y = love.math.random(90, H - 60),
-    vx = math.cos(a) * 70, vy = math.sin(a) * 70, t = 5,
+    kind = kind, x = clamp(x or love.math.random(60, W - 60), 30, W - 30),
+    y = clamp(y or love.math.random(90, H - 60), 60, H - 30),
+    vx = math.cos(a) * 70, vy = math.sin(a) * 70, t = 7,
   }
   Audio.play("appear", 0)
+end
+
+-- weighted: missiles most often, lives least
+function dropItem(x, y)
+  local r = love.math.random(100)
+  local kind = r <= 40 and "missile" or r <= 60 and "bomb" or r <= 85 and "shield" or "life"
+  spawnPickup(kind, x, y)
 end
 
 local function collectPickup(pk, p)
   if pk.kind == "life" then
     p.lives = math.min(5, p.lives + 1)
-    burst(pk.x, pk.y, { 1, 0.4, 0.6 }, 20, 150)
-  else
+  elseif pk.kind == "shield" then
     p.shield = 8
-    burst(pk.x, pk.y, { 0.4, 0.9, 1 }, 20, 150)
+  elseif pk.kind == "missile" then
+    p.missiles = math.min(9, p.missiles + 2)
+  else
+    p.bombs = math.min(3, p.bombs + 1)
   end
+  burst(pk.x, pk.y, PICKUP_COLORS[pk.kind], 20, 150)
   Audio.play("pickup", 0)
   rumble(p, 0.3, 0.15)
 end
@@ -441,8 +496,9 @@ local function placeStar(s)
 end
 
 local LEVEL_NEWS = {
-  [2] = "DRONES SHOOT BACK!",
-  [3] = "GRAB SHIELDS WHEN THEY APPEAR",
+  [1] = "X: SUPER BOMB    Y: SUPER MISSILE",
+  [2] = "DRONES SHOOT BACK!\nGRAB SHIELDS AND MISSILES WHEN THEY APPEAR",
+  [3] = "A BOSS WAITS AT THE END OF THIS LEVEL",
   [4] = "NEW ENEMY: SPINNERS",
   [5] = "STARS ARE ON THE MOVE\nEXTRA LIVES ON ODD LEVELS - BE QUICK",
   [6] = "NEW ENEMY: HUNTERS",
@@ -451,7 +507,8 @@ local LEVEL_NEWS = {
 local function startLevel(n)
   level = n
   starsGot, levelTime = 0, 0
-  rocks, bullets, enemies, ebullets, pickups = {}, {}, {}, {}, {}
+  rocks, bullets, enemies, ebullets = {}, {}, {}, {}  -- pickups stay, so boss drops survive
+  boss = nil
   spawnTimer, enemyTimer = 1.5, 4
   banner = 2.5
   bannerText = "LEVEL " .. n
@@ -471,10 +528,13 @@ local function startLevel(n)
   if LEVEL_NEWS[n] then sub[#sub + 1] = LEVEL_NEWS[n] end
   bannerSub = table.concat(sub, "\n")
 
-  -- shields from level 3, extra lives on odd levels from 5; each shows up once at a random time
+  -- each shows up once at a random time: shields and missiles from level 2, bombs on even levels
+  -- from 4, extra lives on odd levels from 5 (from 3 on EASY). Enemies also drop items now and then.
   pickupPlan = {}
-  if n >= 3 then pickupPlan[#pickupPlan + 1] = { kind = "shield", at = love.math.random(8, 20) } end
-  if n >= 5 and n % 2 == 1 then pickupPlan[#pickupPlan + 1] = { kind = "life", at = love.math.random(6, 18) } end
+  local function plan(kind) pickupPlan[#pickupPlan + 1] = { kind = kind, at = love.math.random(6, 20) } end
+  if n >= 2 then plan("shield"); plan("missile") end
+  if n >= 4 and n % 2 == 0 then plan("bomb") end
+  if n >= (diff.key == "easy" and 3 or 5) and n % 2 == 1 then plan("life") end
 
   for _, s in ipairs(stars) do placeStar(s) end
   if n > 1 then
@@ -487,7 +547,8 @@ local function newGame()
   players = {}
   for i = 1, numPlayers do players[i] = newPlayer(i) end
   stars, particles = {}, {}
-  score, shake, level = 0, 0, 1
+  score, shake, level, flash = 0, 0, 1, 0
+  pickups, boss = {}, nil
   for _ = 1, 3 do stars[#stars + 1] = { t = love.math.random() * 6 } end
   startLevel(1)
 end
@@ -510,7 +571,7 @@ local function spawnRock()
   local alive = alivePlayers()
   local p = alive[love.math.random(#alive)]
   local a = math.atan2(p.y - y, p.x - x) + (love.math.random() - 0.5) * 0.8
-  local speed = 60 + level * 15 + love.math.random() * 50
+  local speed = (60 + level * 15 + love.math.random() * 50) * diff.rock
   makeRock(x, y, love.math.random(10, 24), math.cos(a) * speed, math.sin(a) * speed)
 end
 
@@ -548,13 +609,13 @@ local function gameOver()
     entry = { letters = { Scores.lastName():byte(1, 3) }, pos = 1 }
     state = "entry"
   else
-    Scores.refresh()
+    Scores.refresh(diff.key)
     state = "over"
   end
 end
 
 local function submitEntry()
-  Scores.submit(string.char(unpack(entry.letters)), score, level)
+  Scores.submit(string.char(unpack(entry.letters)), score, level, diff.key)
   state = "over"
 end
 
@@ -613,27 +674,187 @@ local function updatePlayer(p, dt)
   end
 end
 
+---------------------------------------------------------------- boss
+-- After every 3rd level a boss flies in. It sways along the top and cycles through attacks:
+-- an aimed fan, a ring, a spiral stream and (from boss 2) summoning drones. Below half health it
+-- gets angry: faster and shorter pauses. Beating it moves on to the next level.
+
+local BOSS_COLORS = { { 0.9, 0.3, 0.5 }, { 1, 0.55, 0.15 }, { 0.55, 0.4, 1 } }
+
+local function startBoss()
+  local tier = math.floor(level / 3)
+  local hp = (100 + 80 * tier) * diff.boss * (1 + 0.5 * (numPlayers - 1))
+  boss = { x = W / 2, y = -60, r = 38, hp = hp, maxHp = hp, tier = tier, t = 0, flash = 0,
+           cool = 1.5, attack = 0, color = BOSS_COLORS[(tier - 1) % #BOSS_COLORS + 1] }
+  rocks, bullets, enemies, ebullets = {}, {}, {}, {}
+  banner, bannerText, bannerSub = 2.5, "WARNING", "BOSS " .. tier .. " APPROACHING"
+  levelTime = 0
+  pickupPlan = { { kind = "missile", at = 8 }, { kind = "shield", at = 18 } }
+  Audio.play("alarm", 0)
+end
+
+local function hitBoss(dmg, by)
+  local b = boss
+  b.hp = b.hp - dmg
+  b.flash = 0.06
+  if b.hp > 0 then return end
+  -- defeated: explode for a while, leave a life and a bomb behind, then on to the next level
+  b.hp, b.dying = 0, 2.2
+  ebullets = {}
+  score = score + 1000 * b.tier
+  shake = 0.8
+  burst(b.x, b.y, b.color, 80, 320)
+  Audio.play("bomb", 0)
+  spawnPickup("life", b.x - 30, b.y + 40)
+  spawnPickup("bomb", b.x + 30, b.y + 40)
+  for _, p in ipairs(players) do rumble(p, 1, 0.8) end
+end
+
+local function bossAttack(b, enraged)
+  local avail = { "fan", "ring", "spiral" }
+  if b.tier >= 2 and #enemies < 4 then avail[#avail + 1] = "summon" end
+  b.attack = b.attack % #avail + 1
+  local kind = avail[b.attack]
+  if kind == "fan" then
+    local a, n = aimAt(b), 4 + b.tier
+    for k = 0, n - 1 do enemyShot(b, a + (k - (n - 1) / 2) * 0.17, 170) end
+  elseif kind == "ring" then
+    local n = 12 + 4 * b.tier
+    for k = 0, n - 1 do enemyShot(b, b.t + k * math.pi * 2 / n, 120) end
+  elseif kind == "spiral" then
+    b.spiral, b.shotT = enraged and 3 or 2.2, 0
+  else
+    for _, dx in ipairs({ -45, 45 }) do
+      spawnEnemy("drone")
+      local e = enemies[#enemies]
+      e.x, e.y = b.x + dx, b.y + 30
+    end
+  end
+  Audio.play("enemyShot")
+end
+
+local function updateBoss(dt)
+  local b = boss
+  b.t = b.t + dt
+  b.flash = math.max(0, b.flash - dt)
+  if b.dying then
+    b.dying = b.dying - dt
+    if love.math.random() < 0.3 then
+      burst(b.x + love.math.random(-45, 45), b.y + love.math.random(-30, 30), b.color, 14, 180)
+      Audio.play("boomSmall")
+    end
+    if b.dying <= 0 then
+      score = score + 100 * level
+      startLevel(level + 1)
+    end
+    return
+  end
+  -- fly in from the top, then sway side to side
+  if b.y < 110 then b.y = b.y + 70 * dt; return end
+  local enraged = b.hp < b.maxHp / 2
+  b.x = W / 2 + math.sin(b.t * (enraged and 0.9 or 0.6)) * 200
+  b.y = 110 + math.sin(b.t * 1.3) * 20
+  if b.spiral then
+    b.spiral = b.spiral - dt
+    b.shotT = b.shotT - dt
+    if b.shotT <= 0 then
+      b.shotT = 0.08
+      local arms = b.tier >= 3 and 3 or 2
+      for k = 0, arms - 1 do enemyShot(b, b.t * 4 + k * math.pi * 2 / arms, 140) end
+    end
+    if b.spiral <= 0 then b.spiral = nil end
+  else
+    b.cool = b.cool - dt
+    if b.cool <= 0 then
+      bossAttack(b, enraged)
+      b.cool = (enraged and 1.3 or 2) * diff.cool
+    end
+  end
+end
+
+---------------------------------------------------------------- specials
+
+local function fireMissile(p)
+  if not p.alive then return end
+  if p.missiles <= 0 then Audio.play("deflect", 0); return end
+  p.missiles = p.missiles - 1
+  bullets[#bullets + 1] = {
+    x = p.x + math.cos(p.angle) * 12, y = p.y + math.sin(p.angle) * 12,
+    vx = math.cos(p.angle) * 280, vy = math.sin(p.angle) * 280,
+    life = 3, dmg = 30, color = { 1, 0.6, 0.2 }, homing = true, super = true, owner = p,
+  }
+  Audio.play("missile", 0)
+  rumble(p, 0.3, 0.1)
+end
+
+-- wipes out every rock, enemy and enemy bullet on screen and takes a chunk off a boss
+local function superBomb(p)
+  if not p.alive then return end
+  if p.bombs <= 0 then Audio.play("deflect", 0); return end
+  p.bombs = p.bombs - 1
+  flash, shake = 0.5, 0.6
+  for _, r in ipairs(rocks) do
+    burst(r.x, r.y, { 0.7, 0.65, 0.75 }, 10, 150)
+    score = score + 5
+  end
+  rocks = {}
+  for j = #enemies, 1, -1 do killEnemy(j, p) end
+  for _, b in ipairs(ebullets) do burst(b.x, b.y, { 1, 0.3, 0.4 }, 3, 60) end
+  ebullets = {}
+  if boss and not boss.dying then hitBoss(boss.maxHp * 0.15, p) end
+  Audio.play("bomb", 0)
+  rumble(p, 1, 0.5)
+end
+
+-- a super missile blows up everything near where it hits
+local function explode(b)
+  burst(b.x, b.y, { 1, 0.6, 0.2 }, 50, 260)
+  burst(b.x, b.y, { 1, 1, 0.6 }, 20, 120)
+  shake = math.max(shake, 0.35)
+  Audio.play("boom")
+  local r2 = 90 * 90
+  for j = #rocks, 1, -1 do
+    if dist2(rocks[j], b) < r2 then destroyRock(j) end
+  end
+  for j = #enemies, 1, -1 do
+    local e = enemies[j]
+    if dist2(e, b) < r2 then
+      e.hp = e.hp - 10
+      e.flash = 0.08
+      if e.hp <= 0 then killEnemy(j, b.owner) end
+    end
+  end
+end
+
 -- returns true if the bullet hit something
 local function bulletHits(b)
+  local hit = false
+  if boss and not boss.dying and dist2(boss, b) < boss.r * boss.r then
+    hitBoss(b.dmg, b.owner)
+    hit = true
+  end
   for j = #rocks, 1, -1 do
+    if hit then break end
     local r = rocks[j]
     if dist2(r, b) < r.r * r.r then
       r.hp = r.hp - b.dmg
       r.flash = 0.08
       if r.hp <= 0 then destroyRock(j) end
-      return true
+      hit = true
     end
   end
   for j = #enemies, 1, -1 do
+    if hit then break end
     local e = enemies[j]
     if dist2(e, b) < (e.r + 2) ^ 2 then
       e.hp = e.hp - b.dmg
       e.flash = 0.08
       if e.hp <= 0 then killEnemy(j, b.owner) end
-      return true
+      hit = true
     end
   end
-  return false
+  if hit and b.super then explode(b) end
+  return hit
 end
 
 local function updateBullets(dt)
@@ -680,7 +901,7 @@ local function levelComplete()
   for j = #rocks, 1, -1 do destroyRock(j) end      -- startLevel clears the leftover fragments
   for j = #enemies, 1, -1 do killEnemy(j) end
   score = score + 100 * level
-  startLevel(level + 1)
+  if level % 3 == 0 then startBoss() else startLevel(level + 1) end
 end
 
 -- first living, vulnerable player touching o (within extra radius), or nil
@@ -696,20 +917,32 @@ local function updatePlay(dt)
   updateBullets(dt)
   if state ~= "play" then return end
 
-  -- no spawns while the level banner shows; spawns speed up each level
+  flash = math.max(0, flash - dt)
+  if boss then
+    updateBoss(dt)
+    if not boss then return end  -- beaten: the next level has started
+    local p = not boss.dying and touchingPlayer(boss, boss.r * 0.8)
+    if p then
+      damagePlayer(p)
+      if state ~= "play" then return end
+    end
+  end
+
+  -- no spawns while the banner shows or during a boss fight; spawns speed up each level
   if banner > 0 then
     banner = banner - dt
-  else
+  elseif not boss then
     spawnTimer = spawnTimer - dt
     if spawnTimer <= 0 then
       spawnRock()
       spawnTimer = math.max(0.3, 1.3 - level * 0.12) * (0.7 + love.math.random() * 0.6) / (1 + (numPlayers - 1) * 0.3)
+                   * diff.spawn
     end
     if level >= 2 then
       enemyTimer = enemyTimer - dt
       if enemyTimer <= 0 then
         if #enemies < math.min(numPlayers + math.floor(level / 2), 7) then spawnEnemy() end
-        enemyTimer = math.max(2.5, 8 - level * 0.5) * (0.7 + love.math.random() * 0.6)
+        enemyTimer = math.max(2.5, 8 - level * 0.5) * (0.7 + love.math.random() * 0.6) * diff.spawn
       end
     end
   end
@@ -771,6 +1004,7 @@ local function updatePlay(dt)
     end
   end
 
+  if boss then return end  -- no stars to collect during a boss fight
   for _, s in ipairs(stars) do
     s.t = s.t + dt
     if s.vx ~= 0 or s.vy ~= 0 then drift(s, dt, 20) end
@@ -960,10 +1194,62 @@ local function drawEnemy(e)
   love.graphics.pop()
 end
 
+local function drawBoss(b)
+  local enraged = b.hp < b.maxHp / 2
+  local c = b.flash > 0 and { 1, 1, 1 } or b.color
+  love.graphics.push()
+  love.graphics.translate(b.x, b.y)
+  -- wings
+  love.graphics.setColor(c[1] * 0.55, c[2] * 0.55, c[3] * 0.55)
+  love.graphics.polygon("fill", -20, -10, -62, -26, -72, 8, -30, 18)
+  love.graphics.polygon("fill", 20, -10, 30, 18, 72, 8, 62, -26)
+  -- cannons
+  love.graphics.setColor(0.3, 0.3, 0.35)
+  love.graphics.rectangle("fill", -30, 18, 8, 16)
+  love.graphics.rectangle("fill", 22, 18, 8, 16)
+  -- hull
+  local pts = {}
+  for k = 0, 5 do
+    pts[#pts + 1] = math.cos(k * math.pi / 3 + math.pi / 6) * 34
+    pts[#pts + 1] = math.sin(k * math.pi / 3 + math.pi / 6) * 30
+  end
+  love.graphics.setColor(c)
+  love.graphics.polygon("fill", pts)
+  love.graphics.setColor(c[1] * 0.4, c[2] * 0.4, c[3] * 0.4)
+  love.graphics.setLineWidth(3)
+  love.graphics.polygon("line", pts)
+  -- glowing core, red and pulsing faster when angry
+  local pulse = math.sin(b.t * (enraged and 14 or 6))
+  love.graphics.setColor(1, enraged and 0.2 or 0.85, 0.3, 0.35)
+  love.graphics.circle("fill", 0, 0, 16 + pulse * 3)
+  love.graphics.setColor(1, enraged and 0.3 or 0.95, 0.4)
+  love.graphics.circle("fill", 0, 0, 9 + pulse * 2)
+  love.graphics.pop()
+end
+
 local function drawPickup(pk)
   -- blink during the last 1.5 seconds
   if pk.t < 1.5 and math.floor(pk.t * 8) % 2 == 0 then return end
   local pulse = 1 + math.sin(pk.t * 8) * 0.12
+  local c = PICKUP_COLORS[pk.kind]
+  if pk.kind == "missile" or pk.kind == "bomb" then
+    love.graphics.setColor(c[1], c[2], c[3], 0.3)
+    love.graphics.circle("fill", pk.x, pk.y, 13 * pulse)
+    love.graphics.setColor(c)
+    love.graphics.setLineWidth(2)
+    love.graphics.circle("line", pk.x, pk.y, 13 * pulse)
+    if pk.kind == "missile" then
+      love.graphics.polygon("fill", pk.x, pk.y - 9, pk.x + 3, pk.y - 4, pk.x + 3, pk.y + 5, pk.x - 3, pk.y + 5, pk.x - 3, pk.y - 4)
+      love.graphics.polygon("fill", pk.x - 3, pk.y + 1, pk.x - 7, pk.y + 7, pk.x - 3, pk.y + 5)
+      love.graphics.polygon("fill", pk.x + 3, pk.y + 1, pk.x + 3, pk.y + 5, pk.x + 7, pk.y + 7)
+    else
+      love.graphics.circle("fill", pk.x, pk.y + 2, 6)
+      love.graphics.setColor(1, 0.9, 0.5)
+      love.graphics.line(pk.x + 3, pk.y - 3, pk.x + 6, pk.y - 8)
+      love.graphics.circle("fill", pk.x + 6, pk.y - 8, 1.5 + pulse)
+    end
+    return
+  end
   if pk.kind == "life" then
     love.graphics.setColor(1, 0.4, 0.6, 0.35)
     love.graphics.circle("line", pk.x, pk.y, 15 * pulse)
@@ -1036,6 +1322,8 @@ local function drawPlayerHud(p)
   local g = GUNS[p.gun]
   love.graphics.setColor(g.color)
   line(g.name .. (unlockedGuns() > 1 and "  (L/R)" or ""), H - 26)
+  love.graphics.setColor(1, 0.65, 0.3)
+  line("MISSILE x" .. p.missiles .. "  BOMB x" .. p.bombs, H - 66)
   local status = {}
   if p.shield > 0 then status[#status + 1] = "SHIELD " .. math.ceil(p.shield) end
   if p.dashCd <= 0 then status[#status + 1] = "DASH" end
@@ -1046,17 +1334,17 @@ end
 local function drawHud()
   love.graphics.setFont(fontSmall)
   love.graphics.setColor(1, 1, 1)
-  love.graphics.printf("LV " .. level .. "    " .. score, 0, 6, W, "center")
-  love.graphics.setColor(1, 1, 1, 0.5)
+  love.graphics.printf((boss and ("BOSS " .. boss.tier) or ("LV " .. level)) .. "    " .. score, 0, 6, W, "center")
+  love.graphics.setColor(diff.color[1], diff.color[2], diff.color[3], 0.6)
   love.graphics.setFont(fontTiny)
-  love.graphics.printf("BEST " .. best, 0, 40, W - 12, "right")
+  love.graphics.printf(diff.name .. "   BEST " .. best, 0, 40, W - 12, "right")
 
-  -- level progress bar
-  local frac = starsGot / starsNeeded()
+  -- level progress bar, or the boss's health
+  local frac = boss and boss.hp / boss.maxHp or starsGot / starsNeeded()
   love.graphics.setColor(1, 1, 1, 0.15)
-  love.graphics.rectangle("fill", 12, 30, W - 24, 3)
-  love.graphics.setColor(1, 0.85, 0.2)
-  love.graphics.rectangle("fill", 12, 30, (W - 24) * frac, 3)
+  love.graphics.rectangle("fill", 12, 30, W - 24, boss and 5 or 3)
+  if boss then love.graphics.setColor(1, 0.25, 0.3) else love.graphics.setColor(1, 0.85, 0.2) end
+  love.graphics.rectangle("fill", 12, 30, (W - 24) * frac, boss and 5 or 3)
 
   for _, p in ipairs(players) do drawPlayerHud(p) end
 end
@@ -1070,7 +1358,9 @@ local function drawWorld()
 
   if state == "title" or state == "select" then return end
 
-  for _, s in ipairs(stars) do drawStar(s) end
+  if not boss then
+    for _, s in ipairs(stars) do drawStar(s) end
+  end
   for _, pk in ipairs(pickups) do drawPickup(pk) end
 
   love.graphics.setLineWidth(2)
@@ -1084,10 +1374,11 @@ local function drawWorld()
   end
 
   for _, e in ipairs(enemies) do drawEnemy(e) end
+  if boss then drawBoss(boss) end
 
   for _, b in ipairs(bullets) do
     love.graphics.setColor(b.color)
-    love.graphics.circle("fill", b.x, b.y, b.homing and 3.5 or 2.5)
+    love.graphics.circle("fill", b.x, b.y, b.super and 5 or b.homing and 3.5 or 2.5)
   end
 
   for _, b in ipairs(ebullets) do
@@ -1107,6 +1398,10 @@ local function drawWorld()
   end
 
   drawHud()
+  if flash > 0 then
+    love.graphics.setColor(1, 1, 1, flash * 1.6)
+    love.graphics.rectangle("fill", 0, 0, W, H)
+  end
 end
 
 local function drawTitle()
@@ -1129,13 +1424,17 @@ local function drawTitle()
     end
   end
 
+  local dc = diff.color
+  love.graphics.setColor(dc)
+  centered("DIFFICULTY   <  " .. diff.name .. "  >", 290, fontSmall)
+
   love.graphics.setColor(1, 1, 1, 0.8)
   local p2hint = #pads >= 2 and "2 players: each presses A on the ship select screen to join"
                 or "P2: plug in a 2nd gamepad, or arrows + . (fire) / (dash) , (gun)"
-  centered("Collect stars to clear levels. Shoot (A/RT)  Aim (right stick)  Dash (B/LT)  Gun (L/R)\n" .. p2hint, 300, fontTiny)
-  centered("UP/DOWN choose   START continue", 350, fontSmall)
+  centered("Shoot (A/RT)  Aim (right stick)  Dash (B/LT)  Bomb (X)  Missile (Y)  Gun (L/R)\n" .. p2hint, 325, fontTiny)
+  centered("UP/DOWN choose   LEFT/RIGHT difficulty   START continue", 370, fontSmall)
   love.graphics.setColor(1, 1, 1, 0.5)
-  centered("Best: " .. best, 385, fontSmall)
+  centered("Best (" .. diff.name .. "): " .. best, 400, fontSmall)
 end
 
 local function shipTaken(id, ship)
@@ -1255,7 +1554,7 @@ local function drawScoreTable()
   centered("GAME OVER", 50, fontBig)
   centered("Level " .. level .. "    Score " .. score, 100, fontSmall)
   love.graphics.setColor(1, 0.85, 0.3)
-  centered(Scores.status == "online" and "WORLD TOP 5" or "TOP 5", 140, fontSmall)
+  centered((Scores.status == "online" and "WORLD TOP 5" or "TOP 5") .. " - " .. diff.name, 140, fontSmall)
   love.graphics.setFont(fontSmall)
   for i = 1, 5 do
     local e, y = Scores.top[i], 172 + (i - 1) * 28
@@ -1326,7 +1625,11 @@ function love.load()
     love.filesystem.setIdentity("stardrift-test")
     love.filesystem.remove("scores.txt")
   end
-  best = loadBest()
+  for i, d in ipairs(DIFFICULTIES) do
+    if d.key == readSave("difficulty.txt") then diffSel = i end
+  end
+  if TESTING then diffSel = 2 end
+  setDifficulty(diffSel)
   Scores.load(WEB)
   bgstars = {}
   for _ = 1, 80 do
@@ -1345,6 +1648,13 @@ function love.load()
     action("right", 1)
     action("confirm", 1)          -- ... and locks it in
     action("right", 2)            -- P2 also moves onto VIPER, which is now taken
+  end
+  if TEST_BOSS then
+    love.audio.setVolume(0)
+    numPlayers = 2
+    newGame()
+    state, level = "play", 3
+    startBoss()
   end
   if TEST_SCORES then
     love.audio.setVolume(0)
@@ -1409,7 +1719,11 @@ function love.update(dt)
       testSpawned = true
       for _, k in ipairs(ENEMY_ORDER) do spawnEnemy(k) end
       spawnPickup("shield")
+      spawnPickup("missile")
+      spawnPickup("bomb")
       players[2].shield = 8
+      players[1].missiles = 2
+      fireMissile(players[1])
     end
     if love.math.random() < 0.02 then switchGun(players[love.math.random(2)], 1) end
     if testTime > 4.4 and not testShot then
@@ -1437,6 +1751,27 @@ function love.update(dt)
     elseif testTime > 2.5 then
       print("TEST state=" .. state .. " P1 ship=" .. SHIPS[players[1].ship].name ..
             " P2 ship=" .. SHIPS[players[2].ship].name)
+      love.event.quit()
+    end
+  end
+  if TEST_BOSS then
+    testTime = testTime + dt
+    for _, p in ipairs(players) do p.hurt = 1 end  -- invulnerable, so the fight is deterministic
+    if testTime > 3.5 and not testSpawned then
+      testSpawned = true
+      local hp = boss.hp
+      players[1].missiles = 1
+      fireMissile(players[1])
+      superBomb(players[2])
+      print("TEST bomb took " .. math.floor(hp - boss.hp) .. " of " .. math.floor(boss.maxHp) .. " boss hp")
+    elseif testTime > 5 and not testShot then
+      testShot = true
+      love.graphics.captureScreenshot("boss.png")
+    elseif testTime > 6 and boss and not boss.dying then
+      hitBoss(boss.hp, players[1])
+      print("TEST boss defeated, score=" .. score)
+    elseif testTime > 10 then
+      print("TEST state=" .. state .. " level=" .. level .. " boss=" .. tostring(boss) .. " pickups=" .. #pickups)
       love.event.quit()
     end
   end
@@ -1497,7 +1832,7 @@ local function entryAction(a)
   elseif a == "start" then
     submitEntry()
   elseif a == "back" then
-    Scores.refresh()
+    Scores.refresh(diff.key)
     state = "over"
   end
 end
@@ -1535,6 +1870,10 @@ function action(a, id)
   if state == "title" then
     if a == "up" or a == "down" then
       menuSel = menuSel == 1 and 2 or 1
+    elseif a == "left" or a == "right" then
+      setDifficulty(diffSel + (a == "right" and 1 or -1))
+      love.filesystem.write("difficulty.txt", diff.key)
+      Audio.play("blaster", 0)
     elseif a == "start" or a == "confirm" then
       numPlayers = menuSel
       for _, pk in ipairs(picks) do pk.ready = false end
@@ -1553,10 +1892,12 @@ function action(a, id)
   elseif state == "pause" then
     if a == "start" then state = "play"; pauseNote = nil
     elseif a == "back" then state = "title"; pauseNote = nil
-    elseif a == "next" then Audio.toggleMusic() end
+    elseif a == "next" or a == "missile" then Audio.toggleMusic() end
   elseif state == "play" and p then
     if a == "start" or a == "back" then state = "pause"; stopRumble()
     elseif a == "dash" then tryDash(p)
+    elseif a == "bomb" then superBomb(p)
+    elseif a == "missile" then fireMissile(p)
     elseif a == "next" then switchGun(p, 1)
     elseif a == "prev" then switchGun(p, -1) end
   end
@@ -1567,7 +1908,10 @@ local ENTRY_KEYS = {
   up = "up", down = "down", left = "left", right = "right", ["return"] = "start", kpenter = "start",
   backspace = "dash", escape = "back",
 }
-local MENU_KEYS = { up = "up", w = "up", down = "down", s = "down", space = "confirm", z = "confirm" }
+local MENU_KEYS = {
+  up = "up", w = "up", down = "down", s = "down", left = "left", a = "left", right = "right", d = "right",
+  space = "confirm", z = "confirm",
+}
 
 function love.keypressed(k)
   if k == "f11" then
@@ -1584,7 +1928,7 @@ function love.keypressed(k)
   -- per-player keys: find which player's key set owns this key
   for id = 1, numPlayers do
     for _, set in ipairs(keysetsFor({ id = id })) do
-      for _, field in ipairs({ "dash", "prev", "next", "fire", "left", "right" }) do
+      for _, field in ipairs({ "dash", "prev", "next", "fire", "left", "right", "bomb", "missile" }) do
         for _, key in ipairs(set[field] or {}) do
           if key == k then return action(field == "fire" and "confirm" or field, id) end
         end
@@ -1600,8 +1944,8 @@ function love.textinput(t)
 end
 
 local PAD_ACTIONS = {
-  start = "start", back = "back", a = "confirm", x = "confirm", b = "dash",
-  leftshoulder = "prev", rightshoulder = "next", y = "next", dpup = "up", dpdown = "down",
+  start = "start", back = "back", a = "confirm", x = "bomb", y = "missile", b = "dash",
+  leftshoulder = "prev", rightshoulder = "next", dpup = "up", dpdown = "down",
   dpleft = "left", dpright = "right",
 }
 

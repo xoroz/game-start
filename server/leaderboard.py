@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Star Drift leaderboard API. Standard library only (Python 3.8+), scores kept in SQLite.
 
-  GET  /api/scores                                    -> {"top": [{"name", "score", "level"}, ...]}
-  POST /api/scores {"name": "ABC", "score": 1234, "level": 5} -> {"rank": 7, "top": [...]}
+  GET  /api/scores?difficulty=normal                  -> {"top": [{"name", "score", "level"}, ...]}
+  POST /api/scores {"name": "ABC", "score": 1234, "level": 5, "difficulty": "normal"}
+                                                      -> {"rank": 7, "top": [...]}
+Each difficulty (easy, normal, hard) has its own table; a missing difficulty means normal.
 
 In production nginx serves the game files and proxies /stardrift/api/ here.
 For local testing, --static serves the web build from the same port:
@@ -16,12 +18,14 @@ import re
 import sqlite3
 import threading
 import time
+from urllib.parse import parse_qs, urlsplit
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
 TOP_N = 5
 MAX_SCORE = 10_000_000
 POSTS_PER_MINUTE = 10
 NAME_RE = re.compile(r"^[A-Z]{3}$")
+DIFFICULTIES = ("easy", "normal", "hard")
 
 db_lock = threading.Lock()
 recent_posts = {}  # ip -> [timestamps]
@@ -35,13 +39,18 @@ def open_db(path):
         score INTEGER NOT NULL,
         level INTEGER NOT NULL,
         created_at INTEGER NOT NULL)""")
-    db.execute("CREATE INDEX IF NOT EXISTS scores_by_score ON scores (score DESC, id)")
+    columns = [row[1] for row in db.execute("PRAGMA table_info(scores)")]
+    if "difficulty" not in columns:  # databases from before difficulty levels
+        db.execute("ALTER TABLE scores ADD COLUMN difficulty TEXT NOT NULL DEFAULT 'normal'")
+    db.execute("DROP INDEX IF EXISTS scores_by_score")
+    db.execute("CREATE INDEX IF NOT EXISTS scores_by_difficulty ON scores (difficulty, score DESC, id)")
     db.commit()
     return db
 
 
-def top(db):
-    rows = db.execute("SELECT name, score, level FROM scores ORDER BY score DESC, id LIMIT ?", (TOP_N,))
+def top(db, difficulty):
+    rows = db.execute("SELECT name, score, level FROM scores WHERE difficulty = ? ORDER BY score DESC, id LIMIT ?",
+                      (difficulty, TOP_N))
     return [{"name": n, "score": s, "level": l} for n, s, l in rows]
 
 
@@ -76,8 +85,11 @@ class Handler(SimpleHTTPRequestHandler):
 
     def do_GET(self):
         if self.is_api():
+            difficulty = parse_qs(urlsplit(self.path).query).get("difficulty", ["normal"])[0]
+            if difficulty not in DIFFICULTIES:
+                return self.send_json(400, {"error": "unknown difficulty"})
             with db_lock:
-                return self.send_json(200, {"top": top(self.server.db)})
+                return self.send_json(200, {"top": top(self.server.db, difficulty)})
         if self.server.static_dir is None:
             return self.send_json(404, {"error": "not found"})
         return super().do_GET()
@@ -91,7 +103,9 @@ class Handler(SimpleHTTPRequestHandler):
                 raise ValueError("too large")
             body = json.loads(self.rfile.read(length))
             name, score, level = str(body["name"]).upper(), int(body["score"]), int(body["level"])
-            if not NAME_RE.match(name) or not 0 < score <= MAX_SCORE or not 1 <= level <= 999:
+            difficulty = str(body.get("difficulty", "normal"))
+            if (not NAME_RE.match(name) or not 0 < score <= MAX_SCORE or not 1 <= level <= 999
+                    or difficulty not in DIFFICULTIES):
                 raise ValueError("bad values")
         except (ValueError, KeyError, TypeError):
             return self.send_json(400, {"error": "invalid score"})
@@ -99,13 +113,13 @@ class Handler(SimpleHTTPRequestHandler):
             if rate_limited(self.client_ip()):
                 return self.send_json(429, {"error": "slow down"})
             db = self.server.db
-            db.execute("INSERT INTO scores (name, score, level, created_at) VALUES (?, ?, ?, ?)",
-                       (name, score, level, int(time.time())))
+            db.execute("INSERT INTO scores (name, score, level, difficulty, created_at) VALUES (?, ?, ?, ?, ?)",
+                       (name, score, level, difficulty, int(time.time())))
             db.commit()
             new_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
-            rank = db.execute("SELECT COUNT(*) FROM scores WHERE score > ? OR (score = ? AND id < ?)",
-                              (score, score, new_id)).fetchone()[0] + 1
-            return self.send_json(200, {"rank": rank, "top": top(db)})
+            rank = db.execute("SELECT COUNT(*) FROM scores WHERE difficulty = ? AND (score > ? OR (score = ? AND id < ?))",
+                              (difficulty, score, score, new_id)).fetchone()[0] + 1
+            return self.send_json(200, {"rank": rank, "top": top(db, difficulty)})
 
 
 def main():
