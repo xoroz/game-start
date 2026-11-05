@@ -52,3 +52,6 @@ dist/
 # update.sh state on the server
 .deployed-commit
 .update.lock
+
+# Local secrets (GitHub token for pushing)
+.env
