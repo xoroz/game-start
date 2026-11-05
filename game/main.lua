@@ -3,15 +3,17 @@
 --
 -- Controls            Gamepad               Keyboard P1            Keyboard P2
 --   move              d-pad / left stick    WASD                   arrows
---   fire (hold)       A or X                Space / F              Right Ctrl / .
---   dash              B                     Left Shift / G         /
+--   fire (hold)       A, X or right trigger Space / F              Right Ctrl / .
+--   aim + fire        right stick
+--   dash              B or left trigger     Left Shift / G         /
 --   switch gun        L1 / R1 / Y           Q / E                  ,
 --   start / pause     Start                 Enter
 --   music on/off      Y while paused        M
 --   back / quit       Select                Esc
 --   fullscreen                              F11
 -- In 1-player mode every gamepad and both keyboard sets (plus Z / X / Tab) drive P1.
--- In 2-player mode gamepad 1 is P1 and gamepad 2 is P2.
+-- In 2-player mode each gamepad joins by pressing A on the ship select screen (first = P1).
+-- Menus also follow the left stick. Unplugging a player's gamepad pauses the game.
 
 local Audio = require("audio")
 local Scores = require("scores")
@@ -25,6 +27,7 @@ local TEST = os.getenv("STARDRIFT_TEST") == "1"
 local TEST_SELECT = os.getenv("STARDRIFT_TEST") == "select"
 -- dev only: STARDRIFT_TEST=scores ends a game, enters initials, saves scores.png, then quits
 local TEST_SCORES = os.getenv("STARDRIFT_TEST") == "scores"
+local TESTING = TEST or TEST_SELECT or TEST_SCORES   -- real gamepads are ignored while testing
 local testTime, testShot, testSpawned = 0, false, false
 
 local canvas, scale, offx, offy
@@ -39,6 +42,10 @@ local enemies, ebullets, pickups, pickupPlan
 local score, best, level, starsGot, spawnTimer, enemyTimer, levelTime, shake
 local banner, bannerText, bannerSub
 local pads = {}
+local padOwner, playerPad = {}, {}  -- 2-player: joystick -> player id, player id -> joystick
+local stickState = {}               -- joystick -> { dir, t } for left-stick menu navigation
+local pauseNote                     -- extra line on the pause screen
+local rumble                        -- controller vibration, defined in the input section
 local entry  -- initials on the entry screen: { letters = { byte, byte, byte }, pos = 1..3 }
 
 -- star shape is concave, so pre-split it into triangles once
@@ -153,7 +160,7 @@ local function bullet(p, angle, speed, dmg, color, homing)
   bullets[#bullets + 1] = {
     x = p.x + math.cos(p.angle) * 12, y = p.y + math.sin(p.angle) * 12,
     vx = math.cos(angle) * speed, vy = math.sin(angle) * speed,
-    life = 1.4, dmg = dmg, color = color, homing = homing,
+    life = 1.4, dmg = dmg, color = color, homing = homing, owner = p,
   }
 end
 
@@ -235,13 +242,15 @@ local function spawnEnemy(kind)
   enemies[#enemies + 1] = e
 end
 
-local function killEnemy(i)
+-- by = the player who made the kill, if any
+local function killEnemy(i, by)
   local e = enemies[i]
   table.remove(enemies, i)
   burst(e.x, e.y, ENEMIES[e.kind].color, 28, 200)
   score = score + ENEMIES[e.kind].pts
   shake = math.max(shake, 0.15)
   Audio.play("boom")
+  if by then rumble(by, 0.35, 0.12) end
 end
 
 local function updateEnemy(e, dt)
@@ -301,7 +310,51 @@ end
 
 local function padsFor(p)
   if numPlayers == 1 then return pads end
-  return { pads[p.id] }
+  return { playerPad[p.id] }
+end
+
+-- strongest value of a gamepad axis across a list of pads
+local function padAxis(list, name)
+  local v = 0
+  for _, j in ipairs(list) do
+    if j:isGamepad() then
+      local a = j:getGamepadAxis(name)
+      if math.abs(a) > math.abs(v) then v = a end
+    end
+  end
+  return v
+end
+
+function rumble(p, strength, dur)
+  for _, j in ipairs(padsFor(p)) do
+    if j:isVibrationSupported() then j:setVibration(strength, strength, dur) end
+  end
+end
+
+local function stopRumble()
+  for _, j in ipairs(pads) do j:setVibration() end
+end
+
+-- which player a pad drives; in 2-player mode an unclaimed pad joins the first free slot.
+-- Returns nil for a pad with no free slot, and joined = true on the press that claimed one.
+local function padPlayer(j)
+  if numPlayers == 1 or state == "title" then return 1 end
+  if padOwner[j] then return padOwner[j] end
+  for id = 1, numPlayers do
+    if not playerPad[id] then
+      padOwner[j], playerPad[id] = id, j
+      return id, true
+    end
+  end
+end
+
+-- right stick direction for twin-stick aiming, or nil when centred
+local function aimAxis(p)
+  if TEST then return nil end
+  local list = padsFor(p)
+  local x, y = padAxis(list, "rightx"), padAxis(list, "righty")
+  if x * x + y * y < 0.35 ^ 2 then return nil end
+  return x, y
 end
 
 local function keyDown(sets, field)
@@ -346,6 +399,7 @@ local function fireHeld(p)
   if TEST then return true end
   local list = padsFor(p)
   return keyDown(keysetsFor(p), "fire") or padDown(list, "a") or padDown(list, "x")
+      or padAxis(list, "triggerright") > 0.4
 end
 
 ---------------------------------------------------------------- pickups
@@ -368,6 +422,7 @@ local function collectPickup(pk, p)
     burst(pk.x, pk.y, { 0.4, 0.9, 1 }, 20, 150)
   end
   Audio.play("pickup", 0)
+  rumble(p, 0.3, 0.15)
 end
 
 ---------------------------------------------------------------- game
@@ -422,7 +477,10 @@ local function startLevel(n)
   if n >= 5 and n % 2 == 1 then pickupPlan[#pickupPlan + 1] = { kind = "life", at = love.math.random(6, 18) } end
 
   for _, s in ipairs(stars) do placeStar(s) end
-  if n > 1 then Audio.play("levelup", 0) end
+  if n > 1 then
+    Audio.play("levelup", 0)
+    for _, p in ipairs(players) do rumble(p, 0.4, 0.25) end
+  end
 end
 
 local function newGame()
@@ -478,6 +536,7 @@ local function tryDash(p)
     p.dashCd = 0.8
     burst(p.x, p.y, { 0.5, 0.8, 1 }, 12, 120)
     Audio.play("dash")
+    rumble(p, 0.25, 0.08)
   end
 end
 
@@ -503,6 +562,7 @@ local function damagePlayer(p)
   if p.shield > 0 then
     burst(p.x, p.y, { 0.4, 0.9, 1 }, 10, 120)
     Audio.play("deflect")
+    rumble(p, 0.2, 0.08)
     return
   end
   burst(p.x, p.y, { 1, 0.5, 0.3 }, 40, 220)
@@ -510,8 +570,10 @@ local function damagePlayer(p)
   p.lives = p.lives - 1
   p.hurt = 2
   Audio.play("hurt", 0)
+  rumble(p, 0.7, 0.3)
   if p.lives <= 0 then
     p.alive = false
+    rumble(p, 1, 0.6)
     burst(p.x, p.y, { 1, 0.8, 0.4 }, 60, 260)
     if #alivePlayers() == 0 then gameOver() end
   end
@@ -527,7 +589,10 @@ local function updatePlayer(p, dt)
   p.vx, p.vy = p.vx * damp, p.vy * damp
   p.x = clamp(p.x + p.vx * dt, p.r, W - p.r)
   p.y = clamp(p.y + p.vy * dt, p.r, H - p.r)
-  if dx ~= 0 or dy ~= 0 then p.angle = math.atan2(dy, dx) end
+  -- the right stick aims (and fires); otherwise the ship faces where it moves
+  local ax, ay = aimAxis(p)
+  if ax then p.angle = math.atan2(ay, ax)
+  elseif dx ~= 0 or dy ~= 0 then p.angle = math.atan2(dy, dx) end
   p.thrust = math.sqrt(dx * dx + dy * dy)
   p.dash = math.max(0, p.dash - dt)
   p.dashCd = math.max(0, p.dashCd - dt)
@@ -535,7 +600,12 @@ local function updatePlayer(p, dt)
   p.cool = math.max(0, p.cool - dt)
   p.shield = math.max(0, p.shield - dt)
 
-  if fireHeld(p) and p.cool <= 0 then
+  -- left trigger dashes on each pull
+  local lt = padAxis(padsFor(p), "triggerleft") > 0.5
+  if lt and not p.ltHeld then tryDash(p) end
+  p.ltHeld = lt
+
+  if (ax or fireHeld(p)) and p.cool <= 0 then
     local g = GUNS[p.gun]
     g.fire(p, p.angle, g.color)
     p.cool = g.rate
@@ -559,7 +629,7 @@ local function bulletHits(b)
     if dist2(e, b) < (e.r + 2) ^ 2 then
       e.hp = e.hp - b.dmg
       e.flash = 0.08
-      if e.hp <= 0 then killEnemy(j) end
+      if e.hp <= 0 then killEnemy(j, b.owner) end
       return true
     end
   end
@@ -694,7 +764,7 @@ local function updatePlay(dt)
       if p then
         e.hp = e.hp - 3
         e.flash = 0.08
-        if e.hp <= 0 then killEnemy(i) end
+        if e.hp <= 0 then killEnemy(i, p) end
         damagePlayer(p)
         if state ~= "play" then return end
       end
@@ -1060,8 +1130,9 @@ local function drawTitle()
   end
 
   love.graphics.setColor(1, 1, 1, 0.8)
-  local p2hint = #pads >= 2 and "P2 uses gamepad 2" or "P2: plug in a 2nd gamepad, or arrows + . (fire) / (dash) , (gun)"
-  centered("Collect stars to clear levels. Shoot (A)  Dash (B)  Gun (L/R)\n" .. p2hint, 300, fontTiny)
+  local p2hint = #pads >= 2 and "2 players: each presses A on the ship select screen to join"
+                or "P2: plug in a 2nd gamepad, or arrows + . (fire) / (dash) , (gun)"
+  centered("Collect stars to clear levels. Shoot (A/RT)  Aim (right stick)  Dash (B/LT)  Gun (L/R)\n" .. p2hint, 300, fontTiny)
   centered("UP/DOWN choose   START continue", 350, fontSmall)
   love.graphics.setColor(1, 1, 1, 0.5)
   centered("Best: " .. best, 385, fontSmall)
@@ -1088,6 +1159,16 @@ local function drawSelectPanel(id, cx)
   love.graphics.setColor(1, 1, 1, 0.8)
   love.graphics.setFont(fontSmall)
   love.graphics.printf("PLAYER " .. id, cx - 130, 100, 260, "center")
+  if numPlayers == 2 and #pads > 0 then
+    love.graphics.setFont(fontTiny)
+    if playerPad[id] then
+      love.graphics.setColor(0.4, 1, 0.5, 0.8)
+      love.graphics.printf("CONTROLLER CONNECTED", cx - 130, 122, 260, "center")
+    else
+      love.graphics.setColor(1, 0.85, 0.3, 0.6 + 0.4 * math.abs(math.sin(t * 3)))
+      love.graphics.printf("PRESS A ON A CONTROLLER TO JOIN", cx - 130, 122, 260, "center")
+    end
+  end
 
   drawShip(pk.ship, cx, 190 + math.sin(t * 2.5) * 5, -math.pi / 2, 3.5, 0.8, taken and 0.35 or 1)
 
@@ -1211,6 +1292,11 @@ local function drawOverlay()
     love.graphics.rectangle("fill", 0, 0, W, H)
     love.graphics.setColor(1, 1, 1)
     centered("PAUSED", 170, fontBig)
+    if pauseNote then
+      love.graphics.setColor(1, 0.5, 0.4)
+      centered(pauseNote, 215, fontTiny)
+      love.graphics.setColor(1, 1, 1)
+    end
     centered("START resume   SELECT title screen\nY / M music on/off", 250, fontSmall)
   elseif state == "entry" then
     drawEntry()
@@ -1236,7 +1322,7 @@ function love.load()
   love.mouse.setVisible(not HANDHELD)
   if not HANDHELD and not WEB and not TEST and not TEST_SELECT then love.window.maximize() end
   resize(love.graphics.getDimensions())
-  if TEST_SCORES then  -- keep test scores out of the real save folder
+  if TESTING then  -- keep test scores out of the real save folder
     love.filesystem.setIdentity("stardrift-test")
     love.filesystem.remove("scores.txt")
   end
@@ -1276,7 +1362,42 @@ end
 function love.resize(w, h) resize(w, h) end
 
 function love.joystickadded() refreshPads() end
-function love.joystickremoved() refreshPads() end
+
+function love.joystickremoved(j)
+  refreshPads()
+  stickState[j] = nil
+  local id = padOwner[j]
+  if id then padOwner[j], playerPad[id] = nil, nil end
+  if state == "play" and (id or numPlayers == 1) then
+    state = "pause"
+    pauseNote = id and ("P" .. id .. " CONTROLLER DISCONNECTED - reconnect it and press A to rejoin")
+                or "CONTROLLER DISCONNECTED"
+  end
+end
+
+-- the left stick sends up/down/left/right in menus, repeating while held
+local function stickMenus(dt)
+  if TESTING then return end
+  for _, j in ipairs(pads) do
+    if j:isGamepad() then
+      local x, y = j:getGamepadAxis("leftx"), j:getGamepadAxis("lefty")
+      local dir
+      if math.abs(x) > 0.6 and math.abs(x) > math.abs(y) then dir = x > 0 and "right" or "left"
+      elseif math.abs(y) > 0.6 then dir = y > 0 and "down" or "up" end
+      local s = stickState[j] or {}
+      stickState[j] = s
+      local fire = false
+      if dir ~= s.dir then
+        s.dir, s.t, fire = dir, 0.4, dir ~= nil
+      elseif dir then
+        s.t = s.t - dt
+        if s.t <= 0 then s.t, fire = 0.15, true end
+      end
+      local id = (numPlayers == 1 or state == "title") and 1 or padOwner[j]
+      if fire and id then action(dir, id) end
+    end
+  end
+end
 
 function love.update(dt)
   dt = math.min(dt, 1 / 20)  -- avoid huge jumps on frame hitches
@@ -1333,6 +1454,7 @@ function love.update(dt)
     end
   end
   Scores.update(dt)
+  if state ~= "play" then stickMenus(dt) end
   if state == "select" and startDelay then
     startDelay = startDelay - dt
     if startDelay <= 0 then
@@ -1416,6 +1538,7 @@ function action(a, id)
     elseif a == "start" or a == "confirm" then
       numPlayers = menuSel
       for _, pk in ipairs(picks) do pk.ready = false end
+      padOwner, playerPad = {}, {}  -- 2-player: pads join again on the select screen
       state = "select"
     elseif a == "back" and not WEB then   -- quitting in a browser only leaves a frozen canvas
       love.event.quit()
@@ -1428,11 +1551,11 @@ function action(a, id)
     if a == "start" or a == "confirm" then newGame(); state = "play"
     elseif a == "back" then state = "title" end
   elseif state == "pause" then
-    if a == "start" then state = "play"
-    elseif a == "back" then state = "title"
+    if a == "start" then state = "play"; pauseNote = nil
+    elseif a == "back" then state = "title"; pauseNote = nil
     elseif a == "next" then Audio.toggleMusic() end
   elseif state == "play" and p then
-    if a == "start" or a == "back" then state = "pause"
+    if a == "start" or a == "back" then state = "pause"; stopRumble()
     elseif a == "dash" then tryDash(p)
     elseif a == "next" then switchGun(p, 1)
     elseif a == "prev" then switchGun(p, -1) end
@@ -1484,13 +1607,13 @@ local PAD_ACTIONS = {
 
 function love.gamepadpressed(j, button)
   local a = PAD_ACTIONS[button]
-  if not a then return end
-  -- which player owns this pad
-  local id = 1
-  if numPlayers == 2 then
-    for i, pj in ipairs(pads) do
-      if pj == j then id = i end
-    end
+  if not a or TESTING then return end
+  local id, joined = padPlayer(j)
+  if not id then return end  -- a 3rd pad in 2-player mode
+  if joined then
+    Audio.play("pickup", 0)
+    j:setVibration(0.4, 0.4, 0.15)
+    if state == "select" or state == "pause" then return end  -- the joining press does nothing else
   end
   action(a, id)
 end

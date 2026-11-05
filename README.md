@@ -9,15 +9,18 @@ It runs on desktop, on Linux retro handhelds through [PortMaster](https://portma
 | Action | Gamepad | Keyboard P1 | Keyboard P2 |
 |---|---|---|---|
 | Move | D-pad / left stick | WASD | Arrows |
-| Fire (hold) | A or X | Space / F | Right Ctrl / . |
-| Dash | B | Left Shift / G | / |
+| Fire (hold) | A, X or right trigger | Space / F | Right Ctrl / . |
+| Aim + fire | Right stick | | |
+| Dash | B or left trigger | Left Shift / G | / |
 | Switch gun | L1 / R1 / Y | Q / E | , |
 | Start / pause | Start | Enter | |
 | Music on/off | Y while paused | M | |
 | Back / quit | Select | Esc | |
 | Fullscreen | | F11 | |
 
-In 1-player mode every gamepad and both keyboard sets control P1. In 2-player mode gamepad 1 is P1 and gamepad 2 is P2.
+In 1-player mode every gamepad and both keyboard sets control P1. In 2-player mode each player presses A on the ship select screen to claim a gamepad (the first one becomes P1); keyboard sets stay fixed to P1 and P2.
+
+Menus also follow the left stick. Gamepads that support it rumble on hits, kills, pickups, dashes and level-ups. If a player's gamepad is unplugged mid-game, the game pauses; reconnect it and press A to rejoin.
 
 ## Running on desktop
 
